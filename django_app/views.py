@@ -15,6 +15,7 @@ from django.utils import timezone
 from django.db import transaction
 from django.db.models import Q
 from django.core.cache import cache
+from django.contrib.admin.views.decorators import staff_member_required
 
 # Setup structured logging (reduced verbosity for cleaner startup)
 logger = logging.getLogger('faix_chatbot')
@@ -47,6 +48,7 @@ from django_app.models import (
 )
 from backend.nlp.query_preprocessing import QueryProcessor
 from backend.chatbot.knowledge_base import KnowledgeBase
+from backend.chatbot.knowledge_base_db import KnowledgeBaseDB, get_db_knowledge_base
 from backend.chatbot.conversation_manager import process_conversation
 from backend.llm.llm_client import get_llm_client, LLMError
 from backend.chatbot.agents import get_agent, retrieve_for_agent, check_staff_data_available, check_schedule_data_available, _get_staff_documents, _get_schedule_documents
@@ -56,6 +58,7 @@ from backend.chatbot.prompt_builder import build_messages
 query_processor = QueryProcessor()
 # Use JSON-only mode (no database) - all data comes from data/separated/*.json files
 knowledge_base = KnowledgeBase(use_database=False)
+db_knowledge_base = get_db_knowledge_base()
 
 # Print clean startup summary (after all initialization)
 import sys
@@ -1216,6 +1219,39 @@ def chat_api(request):
         user_id = data.get('user_id')
         agent_id = data.get('agent_id')
         history = data.get('history') or []
+
+        # Optional: Quick service-layer integration path
+        # Only short-circuit if it returns a non-empty answer.
+        try:
+            from backend.chat_service import (
+                load_and_validate_request,
+                get_session_and_conversation,
+                determine_routing_and_context,
+                process_query_through_nlp_and_kb,
+                format_response,
+            )
+            payload, service_err = load_and_validate_request(data)
+            if service_err:
+                return JsonResponse({'error': service_err}, status=400)
+            sess, conv = get_session_and_conversation(payload.get('session_id'), payload.get('user_id'))
+            routing = determine_routing_and_context(payload.get('message', ''), context={}, history=payload.get('history') or [])
+            answer, _ctx = process_query_through_nlp_and_kb(payload.get('message', ''), routing.get('context', {}))
+            if isinstance(answer, str) and answer.strip():
+                resp = format_response(
+                    answer,
+                    sess.session_id,
+                    conv.id,
+                    routing.get('intent', 'about_faix'),
+                    0.0,
+                    {},
+                    pdf_url=None,
+                    response_time_ms=0,
+                    agent_id=routing.get('agent_id', 'faq'),
+                )
+                return JsonResponse(resp)
+        except Exception:
+            # If the service layer is not available or errors, fall back to existing flow
+            pass
         
         # Debug log: Check if query was received
         print(f"[DEBUG] Query received: '{user_message}'")
@@ -1223,9 +1259,16 @@ def chat_api(request):
         print(f"[DEBUG] Session ID: {session_id}, User ID: {user_id}, Agent ID: {agent_id}")
         chat_logger.info(f"User query received: '{user_message}' (length: {len(user_message)}, session: {session_id})")
         
+        # SECURITY: Validate message length to prevent DoS attacks
+        MAX_MESSAGE_LENGTH = 10000  # 10,000 characters maximum
         if not user_message:
             return JsonResponse({
                 'error': 'Message is required'
+            }, status=400)
+        
+        if len(user_message) > MAX_MESSAGE_LENGTH:
+            return JsonResponse({
+                'error': f'Message too long. Maximum length is {MAX_MESSAGE_LENGTH} characters.'
             }, status=400)
         
         # Get or create session
@@ -1719,110 +1762,109 @@ def chat_api(request):
         # Agent-based path: use LLM + RAG for all queries
         # Let LLM generate natural responses from context instead of hardcoded answers
         # This makes the chatbot feel more AI-driven and conversational
-            
-            agent = get_agent(agent_id)
-            if not agent:
-                return JsonResponse(
-                    {'error': f"Unknown agent_id '{agent_id}'"},
-                    status=400,
-                )
-
-            # Retrieve context for the agent (FAQ, schedule, staff, etc.)
-            agent_context = retrieve_for_agent(
-                agent_id=agent_id,
-                user_text=normalized_query,  # Use normalized query (with expanded short forms)
-                knowledge_base=knowledge_base,
-                intent=intent,
-                top_k=3,
+        
+        agent = get_agent(agent_id)
+        if not agent:
+            return JsonResponse(
+                {'error': f"Unknown agent_id '{agent_id}'"},
+                status=400,
             )
+        
+        # Retrieve context for the agent (FAQ, schedule, staff, etc.)
+        agent_context = retrieve_for_agent(
+            agent_id=agent_id,
+            user_text=normalized_query,  # Use normalized query (with expanded short forms)
+            knowledge_base=knowledge_base,
+            intent=intent,
+            top_k=3,
+        )
             
-            # CRITICAL: If intent is staff_contact but agent_id is not 'staff', we need to load staff data manually
-            if (intent == 'staff_contact' and agent_id != 'staff') and 'staff' not in agent_context:
-                logger.info(f"Intent is staff_contact but agent_id is {agent_id} - manually loading staff data")
-                staff_docs = _get_staff_documents()
-                if staff_docs:
-                    agent_context['staff'] = staff_docs
-                    logger.info(f"Loaded {len(staff_docs)} staff members for staff_contact intent")
+        # CRITICAL: If intent is staff_contact but agent_id is not 'staff', we need to load staff data manually
+        if (intent == 'staff_contact' and agent_id != 'staff') and 'staff' not in agent_context:
+            logger.info(f"Intent is staff_contact but agent_id is {agent_id} - manually loading staff data")
+            staff_docs = _get_staff_documents()
+            if staff_docs:
+                agent_context['staff'] = staff_docs
+            logger.info(f"Loaded {len(staff_docs)} staff members for staff_contact intent")
+        
+        # Log staff context if available
+        if agent_id == 'staff' or intent == 'staff_contact':
+            staff_docs = agent_context.get('staff', [])
+            logger.debug(f"Staff agent loaded {len(staff_docs)} members")
             
-            # Log staff context if available
-            if agent_id == 'staff' or intent == 'staff_contact':
-                staff_docs = agent_context.get('staff', [])
-                logger.debug(f"Staff agent loaded {len(staff_docs)} members")
-                
-                # Determine if this is a general query (needs all staff) or specific query (can limit)
-                normalized_query_lower = normalized_query.lower()
-                is_general_query = any(kw in normalized_query_lower for kw in [
-                    'who are working', 'who works', 'who work', 'working in faix', 'staff in faix',
-                    'faculty members', 'all staff', 'list of staff', 'show staff', 'who are',
-                    'staff members', 'people working', 'people in faix',
-                    # Additional patterns for general queries
-                    'who is working', 'working at faix', 'working at', 'our team'
-                ])
-                
-                if is_general_query:
-                    # For general queries: Pass ALL staff data to LLM so it can answer based on complete data
-                    logger.info(f"General staff query detected - passing ALL {len(staff_docs)} staff members to LLM")
-                    # Keep all staff, but don't set matched_staff (so it shows all staff in context)
-                    agent_context['staff'] = staff_docs
-                    agent_context['matched_staff'] = []  # No specific matches for general queries
-                else:
-                    # For specific queries: Only pass matched staff + a few others to reduce token usage
-                    matched_staff = match_staff_by_name(normalized_query, staff_docs)  # Use normalized query
-                    if matched_staff:
-                        logger.info(f"Specific staff query detected - {len(matched_staff)} matches found")
-                        matched_staff_list = matched_staff[:5]  # Limit to top 5
-                        # Remove matched staff from full list to avoid duplicates
-                        matched_names = {s.get('name', '').lower() for s in matched_staff_list}
-                        remaining_staff = [s for s in staff_docs if s.get('name', '').lower() not in matched_names]
-                        # Put matched staff first, then remaining staff (limit total to 15 for specific queries)
-                        agent_context['staff'] = matched_staff_list + remaining_staff[:10]
-                        agent_context['matched_staff'] = matched_staff_list
-                        logger.debug(f"Prioritized {len(matched_staff_list)} matched staff, added {len(remaining_staff[:10])} others")
-                    else:
-                        # No specific match, but still a staff query - pass all staff
-                        logger.info(f"No specific staff match - passing ALL {len(staff_docs)} staff members to LLM")
-                        agent_context['staff'] = staff_docs
-                        agent_context['matched_staff'] = []
-
-            # PRIORITY CHECK: For FAQ agent queries about dean, vision, mission, faculty info, etc., check knowledge base first
-            # This ensures we get direct answers for simple factual queries like "who is dean", "vision", "mission"
-            print(f"[DEBUG] Checking factual query conditions: agent_id={agent_id}, intent={intent}, answer={answer}")
-            if (agent_id == 'faq' or intent in ['about_faix', 'staff_contact']) and answer is None:
-                print(f"[DEBUG] Entering factual query check block")
-                # Check for factual queries (dean, vision, mission, established, etc.)
-                # Check both original and normalized query (normalized has expanded short forms)
-                user_message_lower_check = user_message.lower()
-                normalized_query_lower_check = normalized_query.lower()
-                factual_keywords = [
-                    'who is dean', 'who is the dean', 'dean', 'head of faculty',
-                    'vision', 'mission', 'what is the vision', 'what is the mission',
-                    'faix vision', 'faix mission', 'when was faix', 'established',
-                    'objective', 'objectives', 'what are the objectives', 'faix objectives',
-                    'top management', 'management', 'leadership', 'who are the leaders',
-                    'vc', 'nc', 'who is vc', 'who is nc', 'vice chancellor', 'naib canselor',
-                    'chancellor', 'canselor'
-                ]
-                # Check both original and normalized query for factual keywords
-                matched_kw_original = [kw for kw in factual_keywords if kw in user_message_lower_check]
-                matched_kw_normalized = [kw for kw in factual_keywords if kw in normalized_query_lower_check]
-                print(f"[DEBUG] Factual keyword check - Original matched: {matched_kw_original}, Normalized matched: {matched_kw_normalized}")
-                
-                if any(kw in user_message_lower_check for kw in factual_keywords) or any(kw in normalized_query_lower_check for kw in factual_keywords):
-                    logger.info(f"Factual query detected. Original: '{user_message}', Normalized: '{normalized_query}'")
-                    print(f"[DEBUG] Factual query confirmed. Calling knowledge_base.get_answer(intent='{intent}', query='{normalized_query}')")
-                    kb_factual_answer = knowledge_base.get_answer(intent, normalized_query)
-                    print(f"[DEBUG] KB answer received: {kb_factual_answer[:200] if kb_factual_answer else 'None'}")
-                    logger.info(f"KB answer retrieved: {kb_factual_answer[:100] if kb_factual_answer else 'None'}...")
-                    if kb_factual_answer and 'couldn\'t find' not in kb_factual_answer.lower():
-                        logger.info(f"Using knowledge base answer for factual query: {user_message[:50]}")
-                        print(f"[DEBUG] Setting answer from KB: {kb_factual_answer[:100]}")
-                        answer = kb_factual_answer
-                        # Skip LLM call and use KB answer directly
-                    else:
-                        print(f"[DEBUG] KB answer invalid or not found - answer: {kb_factual_answer}")
-                else:
-                    print(f"[DEBUG] No factual keywords matched")
+            # Determine if this is a general query (needs all staff) or specific query (can limit)
+            normalized_query_lower = normalized_query.lower()
+            is_general_query = any(kw in normalized_query_lower for kw in [
+                'who are working', 'who works', 'who work', 'working in faix', 'staff in faix',
+                'faculty members', 'all staff', 'list of staff', 'show staff', 'who are',
+                'staff members', 'people working', 'people in faix',
+                # Additional patterns for general queries
+                'who is working', 'working at faix', 'working at', 'our team'
+            ])
+            
+            if is_general_query:
+                # For general queries: Pass ALL staff data to LLM so it can answer based on complete data
+                logger.info(f"General staff query detected - passing ALL {len(staff_docs)} staff members to LLM")
+                # Keep all staff, but don't set matched_staff (so it shows all staff in context)
+                agent_context['staff'] = staff_docs
+                agent_context['matched_staff'] = []  # No specific matches for general queries
             else:
+                # For specific queries: Only pass matched staff + a few others to reduce token usage
+                matched_staff = match_staff_by_name(normalized_query, staff_docs)  # Use normalized query
+                if matched_staff:
+                    logger.info(f"Specific staff query detected - {len(matched_staff)} matches found")
+                    matched_staff_list = matched_staff[:5]  # Limit to top 5
+                    # Remove matched staff from full list to avoid duplicates
+                    matched_names = {s.get('name', '').lower() for s in matched_staff_list}
+                    remaining_staff = [s for s in staff_docs if s.get('name', '').lower() not in matched_names]
+                    # Put matched staff first, then remaining staff (limit total to 15 for specific queries)
+                    agent_context['staff'] = matched_staff_list + remaining_staff[:10]
+                    agent_context['matched_staff'] = matched_staff_list
+                    logger.debug(f"Prioritized {len(matched_staff_list)} matched staff, added {len(remaining_staff[:10])} others")
+                else:
+                    # No specific match, but still a staff query - pass all staff
+                    logger.info(f"No specific staff match - passing ALL {len(staff_docs)} staff members to LLM")
+                    agent_context['staff'] = staff_docs
+                    agent_context['matched_staff'] = []
+
+        # PRIORITY CHECK: For FAQ agent queries about dean, vision, mission, faculty info, etc., check knowledge base first
+        # This ensures we get direct answers for simple factual queries like "who is dean", "vision", "mission"
+        print(f"[DEBUG] Checking factual query conditions: agent_id={agent_id}, intent={intent}, answer={answer}")
+        if (agent_id == 'faq' or intent in ['about_faix', 'staff_contact']) and answer is None:
+            print(f"[DEBUG] Entering factual query check block")
+            # Check for factual queries (dean, vision, mission, established, etc.)
+            # Check both original and normalized query (normalized has expanded short forms)
+            user_message_lower_check = user_message.lower()
+            normalized_query_lower_check = normalized_query.lower()
+            factual_keywords = [
+                'who is dean', 'who is the dean', 'dean', 'head of faculty',
+                'vision', 'mission', 'what is the vision', 'what is the mission',
+                'faix vision', 'faix mission', 'when was faix', 'established',
+                'objective', 'objectives', 'what are the objectives', 'faix objectives',
+                'top management', 'management', 'leadership', 'who are the leaders',
+                'vc', 'nc', 'who is vc', 'who is nc', 'vice chancellor', 'naib canselor',
+                'chancellor', 'canselor'
+            ]
+            # Check both original and normalized query for factual keywords
+            matched_kw_original = [kw for kw in factual_keywords if kw in user_message_lower_check]
+            matched_kw_normalized = [kw for kw in factual_keywords if kw in normalized_query_lower_check]
+            print(f"[DEBUG] Factual keyword check - Original matched: {matched_kw_original}, Normalized matched: {matched_kw_normalized}")
+            
+            if any(kw in user_message_lower_check for kw in factual_keywords) or any(kw in normalized_query_lower_check for kw in factual_keywords):
+                logger.info(f"Factual query detected. Original: '{user_message}', Normalized: '{normalized_query}'")
+                print(f"[DEBUG] Factual query confirmed. Calling knowledge_base.get_answer(intent='{intent}', query='{normalized_query}')")
+                kb_factual_answer = knowledge_base.get_answer(intent, normalized_query)
+                print(f"[DEBUG] KB answer received: {kb_factual_answer[:200] if kb_factual_answer else 'None'}")
+                logger.info(f"KB answer retrieved: {kb_factual_answer[:100] if kb_factual_answer else 'None'}...")
+                if kb_factual_answer and 'couldn\'t find' not in kb_factual_answer.lower():
+                    logger.info(f"Using knowledge base answer for factual query: {user_message[:50]}")
+                    print(f"[DEBUG] Setting answer from KB: {kb_factual_answer[:100]}")
+                    answer = kb_factual_answer
+                    # Skip LLM call and use KB answer directly
+                else:
+                    print(f"[DEBUG] KB answer invalid or not found - answer: {kb_factual_answer}")
+            else:
+                print(f"[DEBUG] No factual keywords matched")
                 print(f"[DEBUG] Skipping factual query check - conditions not met: agent_id={agent_id}, intent={intent}, answer={answer}")
             
             # PRIORITY CHECK: For schedule queries, check knowledge base first
@@ -2652,6 +2694,16 @@ def get_conversation_history(request):
         # Get messages for specific conversation
         try:
             conversation = Conversation.objects.get(id=conversation_id)
+            # Authorization: require matching session_id unless staff user
+            if not (request.user.is_authenticated and request.user.is_staff):
+                if not session_id:
+                    return JsonResponse({
+                        'error': 'session_id is required'
+                    }, status=400)
+                if not conversation.session or conversation.session.session_id != session_id:
+                    return JsonResponse({
+                        'error': 'Conversation not found'
+                    }, status=404)
             messages = Message.objects.filter(conversation=conversation).order_by('timestamp')[:limit]
             
             messages_data = [{
@@ -2702,6 +2754,7 @@ def get_conversation_history(request):
         }, status=400)
 
 
+@staff_member_required
 @require_http_methods(["GET"])
 def admin_dashboard_data(request):
     """
@@ -2765,7 +2818,7 @@ def admin_dashboard_data(request):
     })
 
 
-@csrf_exempt
+@staff_member_required
 @require_http_methods(["GET", "POST", "PUT", "DELETE"])
 def manage_knowledge_base(request):
     """
@@ -2917,6 +2970,26 @@ def submit_feedback(request):
     """
     try:
         data = json.loads(request.body)
+        
+        # SECURITY: Rate limiting check for feedback endpoint
+        # Use session_id or IP address for rate limiting
+        session_id = data.get('session_id')
+        if session_id:
+            allowed, rate_error = check_rate_limit(f"feedback_{session_id}", limit=10, window=60)
+            if not allowed:
+                return JsonResponse({
+                    'error': rate_error,
+                    'rate_limited': True
+                }, status=429)
+        else:
+            # Fallback to IP-based rate limiting if no session_id
+            ip_address = request.META.get('REMOTE_ADDR', 'unknown')
+            allowed, rate_error = check_rate_limit(f"feedback_ip_{ip_address}", limit=10, window=60)
+            if not allowed:
+                return JsonResponse({
+                    'error': rate_error,
+                    'rate_limited': True
+                }, status=429)
         message_id = data.get('message_id')
         conversation_id = data.get('conversation_id')
         feedback_type = data.get('feedback_type')
@@ -3054,8 +3127,8 @@ def index(request):
     return render(request, 'index.html')
 
 
+@staff_member_required
 def admin_dashboard(request):
     """Serve the admin dashboard page"""
     from django.shortcuts import render
     return render(request, 'admin.html')
-

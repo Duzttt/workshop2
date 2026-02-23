@@ -5,9 +5,13 @@ Converts agent definitions, user input, conversation history and retrieved
 documents into an OpenAI-style list of chat messages suitable for LLMClient.
 """
 
+import logging
 from typing import List, Dict, Any, Optional
 
 from .agents import Agent
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 def _format_faq_context(faq_docs: List[Dict[str, Any]]) -> str:
@@ -391,8 +395,8 @@ def _format_faix_data_context(faix_data: Dict[str, Any]) -> str:
 def build_messages(
     agent: Agent,
     user_message: str,
-    history: Optional[List[Dict[str, str]]],
-    context: Dict[str, List[Dict]],
+    history: List[Dict[str, str]],
+    context: Dict[str, Any],
     intent: Optional[str] = None,
     language_code: str = 'en',
 ) -> List[Dict[str, str]]:
@@ -406,7 +410,13 @@ def build_messages(
         context: Retrieved documents grouped by source key (faq/schedule/staff).
         intent: Optional detected intent string for additional guidance.
         language_code: Detected language code ('en', 'ms', 'zh', 'ar').
+        
+    Returns:
+        List of message dictionaries for the LLM client.
     """
+    logger.info(f"Building messages for agent {agent.id} (intent: {intent}, language: {language_code})")
+    logger.debug(f"Context keys: {list(context.keys())}, history length: {len(history)}")
+    
     messages: List[Dict[str, str]] = []
 
     # Language names for reference
@@ -682,9 +692,12 @@ def build_messages(
             content = turn.get("content")
             if role in ("user", "assistant") and isinstance(content, str) and content:
                 messages.append({"role": role, "content": content})
+        logger.debug(f"Added {len(history)} history turns to messages")
 
     # Latest user message
     messages.append({"role": "user", "content": user_message})
+    
+    logger.info(f"Built {len(messages)} messages for LLM (system + context + history + user)")
 
     return messages
 

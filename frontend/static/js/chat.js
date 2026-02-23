@@ -6,7 +6,7 @@
 // Base URL for the backend API.
 // In development, this can point to your local Django server.
 // For production, update this to your deployed backend URL.
-const API_BASE_URL = 'http://localhost:8000';
+const API_BASE_URL = window.FAIX_API_BASE_URL || window.location.origin;
 
 // Configure marked.js for markdown parsing
 if (typeof marked !== 'undefined') {
@@ -16,6 +16,14 @@ if (typeof marked !== 'undefined') {
         headerIds: false,  // Don't add IDs to headers
         mangle: false,     // Don't mangle email addresses
         sanitize: false,   // We handle sanitization separately
+    });
+    // Strip raw HTML blocks from markdown to reduce XSS risk
+    marked.use({
+        renderer: {
+            html() {
+                return '';
+            }
+        }
     });
 }
 
@@ -477,6 +485,9 @@ class Chatbot {
             
             // Parse markdown
             let htmlContent = marked.parse(sanitized);
+
+            // Sanitize HTML output (strip unsafe tags/attrs/URLs)
+            htmlContent = this.sanitizeBotHtml(htmlContent);
             
             // Add target="_blank" to all links for security
             htmlContent = htmlContent.replace(/<a /g, '<a target="_blank" rel="noopener noreferrer" ');
@@ -605,6 +616,44 @@ class Chatbot {
         
         this.messagesContainer.appendChild(messageDiv);
         this.scrollToBottom();
+    }
+
+    sanitizeBotHtml(html) {
+        try {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+
+            const forbiddenTags = ['script', 'iframe', 'object', 'embed', 'link', 'style', 'meta'];
+            forbiddenTags.forEach(tag => {
+                doc.querySelectorAll(tag).forEach(el => el.remove());
+            });
+
+            const allElements = doc.querySelectorAll('*');
+            allElements.forEach(el => {
+                // Remove inline event handlers
+                [...el.attributes].forEach(attr => {
+                    const name = attr.name.toLowerCase();
+                    const value = String(attr.value || '').toLowerCase();
+                    if (name.startsWith('on')) {
+                        el.removeAttribute(attr.name);
+                        return;
+                    }
+                    if (name === 'href' || name === 'src') {
+                        if (value.startsWith('javascript:') || value.startsWith('data:') || value.startsWith('vbscript:')) {
+                            el.removeAttribute(attr.name);
+                        }
+                    }
+                });
+            });
+
+            return doc.body.innerHTML;
+        } catch (e) {
+            // Fallback: escape everything if sanitizer fails
+            return String(html || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
     }
     
     createFeedbackButtons(messageId, botResponse, intent, userMessage) {
@@ -824,7 +873,7 @@ class Chatbot {
         
         try {
             const response = await this.apiCall(
-                `/api/conversations/?conversation_id=${this.conversationId}`
+                `/api/conversations/?conversation_id=${encodeURIComponent(this.conversationId)}&session_id=${encodeURIComponent(this.sessionId)}`
             );
             
             if (response.ok) {
@@ -836,11 +885,18 @@ class Chatbot {
                     return;
                 }
                 
-                // Clear existing messages (except welcome)
+                // Clear existing messages (except welcome and quick actions)
                 const welcomeMessage = this.messagesContainer.querySelector('.message');
+                const quickActions = this.messagesContainer.querySelector('#quick-actions');
+                
                 this.messagesContainer.innerHTML = '';
+                
                 if (welcomeMessage) {
                     this.messagesContainer.appendChild(welcomeMessage);
+                }
+                
+                if (quickActions) {
+                    this.messagesContainer.appendChild(quickActions);
                 }
                 
                 // Load messages
