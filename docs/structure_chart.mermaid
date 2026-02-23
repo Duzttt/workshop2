@@ -1,0 +1,77 @@
+```mermaid
+graph TD
+    %% Root System
+    System[FAIX Chatbot System]:::main
+
+    %% Level 1: Main Subsystems
+    Frontend[Frontend Client]:::subsystem
+    Backend[Django Backend]:::subsystem
+    
+    System --> Frontend
+    System --> Backend
+
+    %% Level 2: Frontend Modules
+    subgraph FE_Mod [Frontend Modules]
+        direction TB
+        UI_Mgr[UI Manager]
+        API_Client[API Client]
+        Demo_Mgr[Demo Mode Manager]
+    end
+    
+    Frontend --> UI_Mgr
+    Frontend --> API_Client
+    Frontend --> Demo_Mgr
+
+    %% Level 2: Backend Modules
+    subgraph BE_Mod [Backend Modules]
+        direction TB
+        Req_Handler[Request Handler]
+        NLP_Engine[NLP Engine]
+        Agent_Orch[Agent Orchestrator]
+        RAG_Engine[RAG Engine]
+        LLM_Service[LLM Service]
+    end
+
+    Backend --> Req_Handler
+    Backend --> NLP_Engine
+    Backend --> Agent_Orch
+    Backend --> RAG_Engine
+    Backend --> LLM_Service
+
+    %% Level 3: Component Decomposition
+    
+    %% Request Handler
+    Req_Handler --> Validate[Input Validation]
+    Req_Handler --> RateLimit[Rate Limiting]
+    Req_Handler --> FastPath[Fast Path Check]
+
+    %% NLP Engine
+    NLP_Engine --> Preprocess[Text Preprocessing]
+    NLP_Engine --> IntentCls[Intent Classification]
+    NLP_Engine --> EntityExt[Entity Extraction]
+
+    %% Agent Orchestrator
+    Agent_Orch --> Router[Agent Router]
+    Agent_Orch --> Registry[Agent Registry]
+    
+    Registry --> StaffAg[Staff Agent]
+    Registry --> SchedAg[Schedule Agent]
+    Registry --> FAQAg[FAQ Agent]
+
+    %% RAG Engine
+    RAG_Engine --> KB_Load[Knowledge Base Loader]
+    RAG_Engine --> Embed[Embedding Generator]
+    RAG_Engine --> VecSearch[Vector Search]
+
+    %% LLM Service
+    LLM_Service --> PromptBld[Prompt Builder]
+    LLM_Service --> OllamaClient[Ollama Client]
+    LLM_Service --> HallucinationChk[Hallucination Check]
+
+    %% Styling
+    classDef main fill:#2d3748,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef subsystem fill:#4a5568,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef module fill:#e2e8f0,stroke:#2d3748,stroke-width:1px;
+    
+    class UI_Mgr,API_Client,Demo_Mgr,Req_Handler,NLP_Engine,Agent_Orch,RAG_Engine,LLM_Service module;
+```

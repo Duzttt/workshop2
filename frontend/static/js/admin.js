@@ -36,7 +36,7 @@ class AdminDashboard {
     
     async loadDashboardData() {
         try {
-            const response = await fetch('/api/admin/dashboard/');
+            const response = await this.apiCall('/api/admin/dashboard/', { method: 'GET' });
             
             if (!response.ok) {
                 if (response.status === 404) {
@@ -127,7 +127,7 @@ class AdminDashboard {
         if (!container) return;
         
         try {
-            const response = await fetch('/api/admin/kb/');
+            const response = await this.apiCall('/api/admin/kb/', { method: 'GET' });
             
             if (!response.ok) {
                 if (response.status === 404) {
@@ -228,6 +228,33 @@ class AdminDashboard {
             
             entry.style.display = show ? 'block' : 'none';
         });
+    }
+
+    async apiCall(url, options = {}) {
+        const method = (options.method || 'GET').toUpperCase();
+        if (method !== 'GET') {
+            const csrftoken = this.getCookie('csrftoken');
+            if (csrftoken) {
+                options.headers = options.headers || {};
+                options.headers['X-CSRFToken'] = csrftoken;
+            }
+        }
+        return fetch(url, options);
+    }
+
+    getCookie(name) {
+        let cookieValue = null;
+        if (document.cookie && document.cookie !== '') {
+            const cookies = document.cookie.split(';');
+            for (let i = 0; i < cookies.length; i++) {
+                const cookie = cookies[i].trim();
+                if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                    cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                    break;
+                }
+            }
+        }
+        return cookieValue;
     }
 }
 

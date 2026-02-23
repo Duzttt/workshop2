@@ -5,12 +5,29 @@ Agents represent different specialisations (FAQ, schedule, staff contacts, etc.)
 that share the same underlying LLM but use different prompts and context.
 """
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 import json
+from enum import Enum
 
 from .knowledge_base import KnowledgeBase
+
+# Configure logger
+logger = logging.getLogger(__name__)
+
+
+class AgentType(Enum):
+    """Enum for supported agent types."""
+    FAQ = "faq"
+    SCHEDULE = "schedule"
+    STAFF = "staff"
+
+
+class AgentValidationError(Exception):
+    """Raised when agent configuration is invalid."""
+    pass
 
 
 @dataclass
@@ -20,6 +37,32 @@ class Agent:
     description: str
     system_prompt: str
     default_intent: Optional[str] = None
+    max_context_length: int = 4000
+    temperature: float = 0.7
+    max_tokens: int = 500
+    
+    def __post_init__(self):
+        """Validate agent configuration after initialization."""
+        self.validate()
+    
+    def validate(self) -> None:
+        """Validate agent configuration."""
+        if not self.id or not self.id.strip():
+            raise AgentValidationError("Agent ID cannot be empty")
+        
+        if not self.display_name or not self.display_name.strip():
+            raise AgentValidationError("Agent display name cannot be empty")
+        
+        if not self.system_prompt or not self.system_prompt.strip():
+            raise AgentValidationError("Agent system prompt cannot be empty")
+        
+        if self.temperature < 0 or self.temperature > 2:
+            raise AgentValidationError("Agent temperature must be between 0 and 2")
+        
+        if self.max_tokens <= 0:
+            raise AgentValidationError("Agent max_tokens must be positive")
+        
+        logger.debug(f"Agent {self.id} validation passed")
 
 
 class AgentRegistry:
@@ -28,6 +71,43 @@ class AgentRegistry:
     def __init__(self) -> None:
         self._agents: Dict[str, Agent] = {}
         self._init_default_agents()
+        logger.info(f"Initialized AgentRegistry with {len(self._agents)} agents")
+
+    def register(self, agent: Agent) -> None:
+        """Register an agent with the registry."""
+        try:
+            agent.validate()
+            self._agents[agent.id] = agent
+            logger.info(f"Registered agent: {agent.id} ({agent.display_name})")
+        except AgentValidationError as e:
+            logger.error(f"Failed to register agent {agent.id}: {e}")
+            raise
+
+    def get(self, agent_id: str) -> Optional[Agent]:
+        """Get an agent by ID."""
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            logger.warning(f"Agent {agent_id} not found in registry")
+        return agent
+
+    def list_agents(self) -> List[Agent]:
+        """List all registered agents."""
+        return list(self._agents.values())
+
+    def list_agent_ids(self) -> List[str]:
+        """List all registered agent IDs."""
+        return list(self._agents.keys())
+
+    def validate_all(self) -> bool:
+        """Validate all registered agents."""
+        try:
+            for agent_id, agent in self._agents.items():
+                agent.validate()
+            logger.info(f"All {len(self._agents)} agents validated successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Agent validation failed: {e}")
+            return False
 
     def _init_default_agents(self) -> None:
         """Register built-in agents."""
@@ -251,15 +331,6 @@ class AgentRegistry:
             )
         )
 
-    def register(self, agent: Agent) -> None:
-        self._agents[agent.id] = agent
-
-    def get(self, agent_id: str) -> Optional[Agent]:
-        return self._agents.get(agent_id)
-
-    def list_agents(self) -> List[Agent]:
-        return list(self._agents.values())
-
 
 _registry: Optional[AgentRegistry] = None
 
@@ -323,7 +394,7 @@ def _load_separated_json_file(key: str) -> Any:
     return None
 
 
-def _get_schedule_documents() -> List[Dict[str, str]]:
+def _get_schedule_documents() -> List[Dict[str, Any]]:
     """Load schedule entries from data/separated/schedule.json."""
     # Try to load from separated files first
     data = _load_separated_json_file("schedule")
@@ -337,7 +408,7 @@ def _get_schedule_documents() -> List[Dict[str, str]]:
         else:
             data = _load_json_file(data_dir / "schedule.json")
     
-    docs: List[Dict[str, str]] = []
+    docs: List[Dict[str, Any]] = []
     if isinstance(data, list):
         for item in data:
             if not isinstance(item, dict):
@@ -353,7 +424,7 @@ def _get_schedule_documents() -> List[Dict[str, str]]:
     return docs
 
 
-def _get_staff_documents() -> List[Dict[str, str]]:
+def _get_staff_documents() -> List[Dict[str, Any]]:
     """Load staff contact entries from data/separated/staff_contacts.json."""
     import logging
     logger = logging.getLogger(__name__)
@@ -373,7 +444,7 @@ def _get_staff_documents() -> List[Dict[str, str]]:
             data = _load_json_file(data_dir / "staff_contacts.json")
             logger.debug(f"[_get_staff_documents] Loaded from staff_contacts.json")
     
-    docs: List[Dict[str, str]] = []
+    docs: List[Dict[str, Any]] = []
     
     if not data:
         logger.warning("[_get_staff_documents] No data loaded - returning empty list")
@@ -623,20 +694,37 @@ def retrieve_for_agent(
     knowledge_base: KnowledgeBase,
     intent: Optional[str] = None,
     top_k: int = 3,
-) -> Dict[str, List[Dict]]:
+) -> Dict[str, Any]:
     """
     Retrieve context documents for a given agent.
 
     Returns a dict with keys like 'faq', 'schedule', 'staff' so the caller can
     decide how to inject them into the prompt.
+    
+    Args:
+        agent_id: The agent identifier.
+        user_text: The user's query text.
+        knowledge_base: The knowledge base to search (JSON-based, kept for backward compatibility).
+        intent: Optional detected intent.
+        top_k: Number of documents to retrieve.
+        
+    Returns:
+        Dictionary containing context documents for the agent.
     """
     agent = get_agent(agent_id)
     if agent is None:
+        logger.warning(f"Agent {agent_id} not found, returning empty context")
         return {}
 
-    context: Dict[str, List[Dict]] = {}
+    context: Dict[str, Any] = {}
+    
+    logger.info(f"Retrieving context for agent {agent_id} with query: {user_text[:50]}...")
 
-    # FAQ-style documents from the main knowledge base
+    # Use database knowledge base for better performance
+    from backend.chatbot.knowledge_base_db import get_db_knowledge_base
+    db_kb = get_db_knowledge_base()
+    
+    # FAQ-style documents from the database knowledge base
     # Use agent.default_intent if provided, otherwise fall back to detected intent.
     kb_intent = agent.default_intent or intent
     
@@ -647,54 +735,271 @@ def retrieve_for_agent(
     
     try:
         # First try with the detected intent
-        faq_docs = knowledge_base.get_documents(kb_intent, user_text, top_k=top_k)
+        faq_docs = db_kb.get_documents(kb_intent or 'about_faix', user_text, top_k=top_k)
         
         # If it's a fee query and we didn't get good results, explicitly search for 'fees' category
         if is_fee_query and (not faq_docs or len(faq_docs) == 0):
-            fee_docs = knowledge_base.get_documents('fees', user_text, top_k=top_k)
+            fee_docs = db_kb.get_documents('fees', user_text, top_k=top_k)
             if fee_docs:
                 faq_docs = fee_docs
+                logger.debug(f"Found {len(fee_docs)} fee-related documents")
         
         # IMPROVEMENT: Filter out low-relevance documents
         # Only include docs with score > 0.1 to avoid irrelevant matches
         MIN_FAQ_SCORE = 0.1
         if faq_docs:
+            original_count = len(faq_docs)
             faq_docs = [doc for doc in faq_docs if doc.get('score', 0) > MIN_FAQ_SCORE]
+            filtered_count = original_count - len(faq_docs)
+            if filtered_count > 0:
+                logger.debug(f"Filtered out {filtered_count} low-relevance documents")
             
     except Exception as e:
-        print(f"Warning: Knowledge base document retrieval failed: {e}")
+        logger.error(f"Knowledge base document retrieval failed: {e}", exc_info=True)
         faq_docs = []
 
     if faq_docs:
         context["faq"] = faq_docs
+        logger.debug(f"Added {len(faq_docs)} FAQ documents to context")
 
     # Agent-specific data retrieval - each agent gets ONLY its relevant data
-    if agent.id == "faq":
+    if agent.id == AgentType.FAQ.value:
         # FAQ agent: FAQ docs + FAIX data for programs, admission, facilities, etc. (NOT staff or schedule)
-        faix_data = _get_faix_data_for_faq()
+        # Load FAIX data from database
+        faix_data = _get_faix_data_for_faq_db()
         if faix_data:
             context["faix_data"] = faix_data
+            logger.debug(f"Added {len(faix_data)} FAIX data sections to FAQ agent context")
     
-    elif agent.id == "schedule":
+    elif agent.id == AgentType.SCHEDULE.value:
         # Schedule agent: Schedule docs + schedule-related FAIX data only
-        schedule_docs = _get_schedule_documents()
+        schedule_docs = _get_schedule_documents_db()
         if schedule_docs:
             context["schedule"] = schedule_docs
+            logger.debug(f"Added {len(schedule_docs)} schedule documents to Schedule agent context")
         
-        faix_data = _get_faix_data_for_schedule()
+        faix_data = _get_faix_data_for_schedule_db()
         if faix_data:
             context["faix_data"] = faix_data
+            logger.debug(f"Added {len(faix_data)} FAIX data sections to Schedule agent context")
     
-    elif agent.id == "staff":
+    elif agent.id == AgentType.STAFF.value:
         # Staff agent: Staff docs + staff-related FAIX data only
-        staff_docs = _get_staff_documents()
+        staff_docs = _get_staff_documents_db()
         if staff_docs:
             context["staff"] = staff_docs
+            logger.debug(f"Added {len(staff_docs)} staff documents to Staff agent context")
         
-        faix_data = _get_faix_data_for_staff()
+        faix_data = _get_faix_data_for_staff_db()
         if faix_data:
             context["faix_data"] = faix_data
+            logger.debug(f"Added {len(faix_data)} FAIX data sections to Staff agent context")
 
     return context
+
+
+# ============================================
+# Database-based Data Retrieval Functions
+# ============================================
+
+def _get_faix_data_for_faq_db() -> Dict[str, Any]:
+    """Load FAIX data from database for FAQ agent."""
+    try:
+        from django_app.models import (
+            FacultyInfo, VisionMission, Programme, Admission, Department,
+            Facility, AcademicResource, ResearchFocus, CourseInfo,
+            KeyHighlight, FAQ
+        )
+        
+        data = {}
+        
+        # Load faculty info
+        faculty = FacultyInfo.objects.first()
+        if faculty:
+            data['faculty_info'] = {
+                'name': faculty.name,
+                'university': faculty.university,
+                'dean': faculty.dean,
+                'established': faculty.established,
+            }
+        
+        # Load vision & mission
+        vm = VisionMission.objects.first()
+        if vm:
+            data['vision_mission'] = {
+                'vision': vm.vision,
+                'mission': vm.mission,
+                'objectives': vm.objectives,
+            }
+        
+        # Load programmes
+        programs = Programme.objects.all()
+        if programs:
+            data['programmes'] = {
+                'undergraduate': list(programs.filter(programme_type='undergraduate').values(
+                    'name', 'code', 'duration', 'focus_areas', 'career_opportunities'
+                )),
+                'postgraduate': list(programs.filter(programme_type='postgraduate').values(
+                    'name', 'code', 'programme_focus', 'programme_format'
+                )),
+            }
+        
+        # Load admission
+        admissions = Admission.objects.all()
+        if admissions:
+            data['admission'] = {
+                adm.admission_type: {
+                    'requirements': adm.requirements,
+                    'application_links': adm.application_links,
+                    'learning_approach': adm.learning_approach,
+                    'language_requirements': adm.language_requirements,
+                }
+                for adm in admissions
+            }
+        
+        # Load departments
+        departments = Department.objects.all()
+        if departments:
+            data['departments'] = list(departments.values('name', 'focus'))
+        
+        # Load facilities
+        facilities = Facility.objects.all()
+        if facilities:
+            data['facilities'] = list(facilities.values('name', 'facility_type', 'block', 'level'))
+        
+        # Load academic resources
+        resources = AcademicResource.objects.all()
+        if resources:
+            data['academic_resources'] = list(resources.values('name', 'resource_type', 'url', 'description'))
+        
+        # Load research focus
+        research = ResearchFocus.objects.all()
+        if research:
+            data['research_focus'] = list(research.values('name', 'description'))
+        
+        # Load key highlights
+        highlights = KeyHighlight.objects.all()
+        if highlights:
+            data['key_highlights'] = [h.highlight for h in highlights]
+        
+        # Load FAQs
+        faqs = FAQ.objects.all()
+        if faqs:
+            data['faqs'] = list(faqs.values('question', 'answer', 'category'))
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error loading FAIX data from database: {e}", exc_info=True)
+        return {}
+
+
+def _get_faix_data_for_schedule_db() -> Dict[str, Any]:
+    """Load FAIX data from database for Schedule agent."""
+    try:
+        from django_app.models import FacultyInfo, ScheduleData, AcademicResource
+        
+        data = {}
+        
+        # Load basic faculty info
+        faculty = FacultyInfo.objects.first()
+        if faculty:
+            data['faculty_info'] = {
+                'name': faculty.name,
+                'university': faculty.university,
+            }
+        
+        # Load schedule data
+        schedule = ScheduleData.objects.all()
+        if schedule:
+            data['schedule'] = list(schedule.values('title', 'description', 'time', 'category'))
+        
+        # Load academic resources (for timetable links)
+        resources = AcademicResource.objects.filter(resource_type__icontains='timetable')
+        if resources:
+            data['academic_resources'] = list(resources.values('name', 'url', 'description'))
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error loading schedule data from database: {e}", exc_info=True)
+        return {}
+
+
+def _get_faix_data_for_staff_db() -> Dict[str, Any]:
+    """Load FAIX data from database for Staff agent."""
+    try:
+        from django_app.models import FacultyInfo, TopManagement
+        
+        data = {}
+        
+        # Load basic faculty info
+        faculty = FacultyInfo.objects.first()
+        if faculty:
+            data['faculty_info'] = {
+                'name': faculty.name,
+                'university': faculty.university,
+                'dean': faculty.dean,
+            }
+        
+        # Load top management
+        management = TopManagement.objects.all()
+        if management:
+            data['top_management'] = list(management.values('name', 'position', 'title', 'email'))
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"Error loading staff data from database: {e}", exc_info=True)
+        return {}
+
+
+def _get_staff_documents_db() -> List[Dict[str, Any]]:
+    """Load staff documents from database."""
+    try:
+        from django_app.models import TopManagement
+        
+        staff = TopManagement.objects.all()
+        docs = []
+        
+        for person in staff:
+            doc = {
+                'name': person.name,
+                'position': person.position,
+                'title': person.title,
+                'email': person.email,
+                'keywords': person.keywords,
+            }
+            docs.append(doc)
+        
+        return docs
+        
+    except Exception as e:
+        logger.error(f"Error loading staff documents from database: {e}", exc_info=True)
+        return []
+
+
+def _get_schedule_documents_db() -> List[Dict[str, Any]]:
+    """Load schedule documents from database."""
+    try:
+        from django_app.models import ScheduleData
+        
+        schedule = ScheduleData.objects.all()
+        docs = []
+        
+        for item in schedule:
+            doc = {
+                'title': item.title,
+                'description': item.description,
+                'time': item.time,
+                'category': item.category,
+            }
+            docs.append(doc)
+        
+        return docs
+        
+    except Exception as e:
+        logger.error(f"Error loading schedule documents from database: {e}", exc_info=True)
+        return []
 
 

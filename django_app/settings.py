@@ -11,9 +11,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-dev-key-change-in-production')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Read from environment variable, default to False for safety
+DEBUG = os.getenv('DEBUG', 'false').lower() == 'true'
 
-ALLOWED_HOSTS = ['*']  # Allow access from any host (development only)
+# SECURITY: Restrict allowed hosts
+# Read from environment variable, with safe defaults for development
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+# Remove any empty strings and strip whitespace
+ALLOWED_HOSTS = [host.strip() for host in ALLOWED_HOSTS if host.strip()]
 
 # Application definition
 INSTALLED_APPS = [
@@ -115,9 +120,18 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# CORS settings (allowing all origins for local network access)
-# In production, restrict this to specific domains
-CORS_ALLOW_ALL_ORIGINS = True  # Allows access from other devices on local network
+# CORS settings
+# SECURITY: Restrict to specific origins in production
+# Read from environment variable, with safe defaults for development
+cors_allowed_origins = os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:8000')
+if cors_allowed_origins == '*':
+    # Only allow all origins if explicitly set (not recommended for production)
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    # Restrict to specific origins
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGINS = [origin.strip() for origin in cors_allowed_origins.split(',') if origin.strip()]
+
 CORS_ALLOW_CREDENTIALS = True
 
 # Firebase configuration (optional)
